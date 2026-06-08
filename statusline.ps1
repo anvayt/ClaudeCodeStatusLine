@@ -30,7 +30,7 @@ $bold   = "${esc}[1m"
 # Badge styling for the model "pill"
 $bgModel = "${esc}[48;2;30;102;180m"      # blue badge background
 $fgBadge = "${esc}[1;38;2;245;248;255m"   # bright bold text on the badge
-$st      = "${esc}\"                       # OSC string terminator (ESC + backslash)
+$bel     = [char]0x07                      # OSC terminator (BEL) — the form Claude Code's renderer recognizes
 
 # Background colors for pills + the usage bar. These render via SGR codes (not fonts),
 # so they show as solid filled blocks even where Unicode glyphs fall back to "?".
@@ -86,7 +86,8 @@ function Test-VersionGreaterThan([string]$a, [string]$b) {
 # Wrap text in an OSC 8 terminal hyperlink (clickable in supporting terminals)
 function Format-Hyperlink([string]$url, [string]$text) {
     if (-not $url) { return $text }
-    return "${esc}]8;;${url}${st}${text}${esc}]8;;${st}"
+    # OSC 8 hyperlink, BEL-terminated to match the official Claude Code docs example
+    return "${esc}]8;;${url}${bel}${text}${esc}]8;;${bel}"
 }
 
 # Return a background-color escape based on usage percentage (for the filled bar)
