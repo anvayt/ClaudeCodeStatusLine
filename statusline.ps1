@@ -25,6 +25,12 @@ $purple = "${esc}[38;2;167;139;250m"
 $white  = "${esc}[38;2;220;220;220m"
 $dim    = "${esc}[2m"
 $reset  = "${esc}[0m"
+$bold   = "${esc}[1m"
+
+# Badge styling for the model "pill"
+$bgModel = "${esc}[48;2;30;102;180m"      # blue badge background
+$fgBadge = "${esc}[1;38;2;245;248;255m"   # bright bold text on the badge
+$st      = "${esc}\"                       # OSC string terminator (ESC + backslash)
 
 # Format token counts (e.g., 50k / 200k)
 function Format-Tokens([long]$num) {
@@ -64,6 +70,46 @@ function Test-VersionGreaterThan([string]$a, [string]$b) {
     } catch {
         return $false
     }
+}
+
+# Wrap text in an OSC 8 terminal hyperlink (clickable in supporting terminals)
+function Format-Hyperlink([string]$url, [string]$text) {
+    if (-not $url) { return $text }
+    return "${esc}]8;;${url}${st}${text}${esc}]8;;${st}"
+}
+
+# Build a compact horizontal usage bar (e.g. ███░░░) colored by fill level
+function Format-UsageBar([int]$pct, [int]$cells) {
+    if ($pct -lt 0) { $pct = 0 }
+    if ($pct -gt 100) { $pct = 100 }
+    $filled = [int][math]::Round($pct * $cells / 100)
+    if ($filled -gt $cells) { $filled = $cells }
+    $color = Get-UsageColor $pct
+    $on  = [string]([char]0x2588) * $filled            # █
+    $off = [string]([char]0x2591) * ($cells - $filled)  # ░
+    return "${color}${on}${reset}${dim}${off}${reset}"
+}
+
+# Whole hours remaining until a Unix-epoch reset
+function Get-HoursLeftFromEpoch($epoch) {
+    if ($null -eq $epoch -or "$epoch" -eq "null" -or "$epoch" -eq "" -or "$epoch" -eq "0") { return $null }
+    try {
+        $dt = [DateTimeOffset]::FromUnixTimeSeconds([long]$epoch)
+        $h = [math]::Ceiling(($dt - [DateTimeOffset]::Now).TotalHours)
+        if ($h -lt 0) { $h = 0 }
+        return [int]$h
+    } catch { return $null }
+}
+
+# Whole hours remaining until an ISO-8601 reset
+function Get-HoursLeftFromIso([string]$iso) {
+    if (-not $iso -or $iso -eq "null") { return $null }
+    try {
+        $dt = [DateTimeOffset]::Parse($iso)
+        $h = [math]::Ceiling(($dt - [DateTimeOffset]::Now).TotalHours)
+        if ($h -lt 0) { $h = 0 }
+        return [int]$h
+    } catch { return $null }
 }
 
 # ===== Extract data from JSON =====
@@ -114,38 +160,41 @@ if ($data.effort.level) {
 }
 if (-not $effortLevel) { $effortLevel = "medium" }
 
-# ===== Claude CLI version (cached, 1h TTL) =====
-$cacheDir = Join-Path $env:TEMP "claude"
-$cliVersionCache = Join-Path $cacheDir "statusline-cli-version"
-$cliVersion = $null
-$cliVersionMaxAge = 3600
-
-if (Test-Path $cliVersionCache) {
-    $cvMtime = (Get-Item $cliVersionCache).LastWriteTime
-    $cvAge = ((Get-Date) - $cvMtime).TotalSeconds
-    if ($cvAge -lt $cliVersionMaxAge) {
-        $cliVersion = (Get-Content $cliVersionCache -Raw).Trim()
-    }
-}
-
-if (-not $cliVersion) {
+# ===== Permission mode (not exposed in stdin JSON — read from transcript) =====
+# Claude Code records the active permission mode on every transcript entry and emits a
+# dedicated {"type":"permission-mode",...} event on each shift+tab toggle, so the most
+# recent permissionMode value in the transcript is the live mode. The status line re-runs
+# whenever the permission mode changes, so this segment updates on shift+tab.
+$permMode = $null
+$transcriptPath = $data.transcript_path
+if ($transcriptPath -and (Test-Path -LiteralPath $transcriptPath)) {
     try {
-        $cvOutput = & claude --version 2>$null
-        if ($cvOutput) {
-            $cliVersion = ($cvOutput -split '\s')[0]
-            if ($cliVersion) {
-                if (-not (Test-Path $cacheDir)) { New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null }
-                $cliVersion | Set-Content $cliVersionCache -Force
-            }
+        $tail = @(Get-Content -LiteralPath $transcriptPath -Tail 200 -ErrorAction Stop)
+        for ($i = $tail.Count - 1; $i -ge 0; $i--) {
+            $mm = [regex]::Match($tail[$i], '"permissionMode":"([a-zA-Z]+)"')
+            if ($mm.Success) { $permMode = $mm.Groups[1].Value; break }
         }
     } catch {}
 }
 
+# Map permission mode to a compact label + color
+$modeLabel = $null
+$modeColor = $white
+switch ($permMode) {
+    "default"           { $modeLabel = "default";      $modeColor = $white }
+    "auto"              { $modeLabel = "auto";         $modeColor = $green }
+    "acceptEdits"       { $modeLabel = "accept-edits"; $modeColor = $yellow }
+    "plan"              { $modeLabel = "plan";         $modeColor = $cyan }
+    "bypassPermissions" { $modeLabel = "bypass";       $modeColor = $red }
+    default             { if ($permMode) { $modeLabel = $permMode } }
+}
+
 # ===== Build single-line output =====
 $out = ""
-$out += "${blue}${modelName}${reset}"
+# Model "pill": diamond glyph + name on a colored badge
+$out += "${bgModel}${fgBadge} $([char]0x25C6) ${modelName} ${reset}"
 
-# Current working directory
+# Current working directory (clickable GitHub repo/branch link when available)
 $cwd = $data.cwd
 if ($cwd) {
     $displayDir = Split-Path $cwd -Leaf
@@ -153,10 +202,28 @@ if ($cwd) {
     try {
         $gitBranch = git -C $cwd rev-parse --abbrev-ref HEAD 2>$null
     } catch {}
-    $out += " ${dim}|${reset} "
-    $out += "${cyan}${displayDir}${reset}"
+
+    # Build a clickable GitHub URL from origin repo info (provided in the stdin JSON)
+    $repoHost  = $data.workspace.repo.host
+    $repoOwner = $data.workspace.repo.owner
+    $repoName  = $data.workspace.repo.name
+    $branchUrl = $null
+    if ($repoHost -and $repoOwner -and $repoName) {
+        if ($gitBranch) {
+            $branchUrl = "https://${repoHost}/${repoOwner}/${repoName}/tree/${gitBranch}"
+        } else {
+            $branchUrl = "https://${repoHost}/${repoOwner}/${repoName}"
+        }
+    }
+
+    $dirText = "${cyan}${displayDir}${reset}"
     if ($gitBranch) {
-        $out += "${dim}@${reset}${green}${gitBranch}${reset}"
+        $dirText += "${dim}@${reset}${green}${gitBranch}${reset}"
+    }
+    $out += " ${dim}|${reset} "
+    $out += Format-Hyperlink $branchUrl $dirText
+
+    if ($gitBranch) {
         try {
             $numstat = git -C $cwd diff --numstat 2>$null
             if ($numstat) {
@@ -176,15 +243,19 @@ if ($cwd) {
 
 $out += " ${dim}|${reset} "
 $out += "${orange}${usedTokens}/${totalTokens}${reset} ${dim}(${reset}${green}${pctUsed}%${reset}${dim})${reset}"
+if ($modeLabel) {
+    $out += " ${dim}|${reset} "
+    $out += "mode: ${modeColor}${modeLabel}${reset}"
+}
 $out += " ${dim}|${reset} "
-$out += "effort: "
+$out += "${dim}effort${reset} "
 switch ($effortLevel) {
-    "low"    { $out += "${dim}${effortLevel}${reset}" }
-    "medium" { $out += "${orange}med${reset}" }
-    "high"   { $out += "${green}${effortLevel}${reset}" }
-    "xhigh"  { $out += "${purple}${effortLevel}${reset}" }
-    "max"    { $out += "${red}${effortLevel}${reset}" }
-    default  { $out += "${green}${effortLevel}${reset}" }
+    "low"    { $out += "${dim}$([char]0x2582) low${reset}" }
+    "medium" { $out += "${orange}$([char]0x2584) med${reset}" }
+    "high"   { $out += "${green}$([char]0x2586) high${reset}" }
+    "xhigh"  { $out += "${purple}${bold}$([char]0x2587) xhigh${reset}" }
+    "max"    { $out += "${red}${bold}$([char]0x2588) max${reset}" }
+    default  { $out += "${green}$([char]0x2586) ${effortLevel}${reset}" }
 }
 
 # ===== OAuth token resolution =====
@@ -374,17 +445,15 @@ if ($effectiveBuiltin) {
     if ($null -ne $builtinFiveHourPct) {
         $fiveHourPct = [math]::Floor([double]$builtinFiveHourPct)
         $fiveHourColor = Get-UsageColor $fiveHourPct
-        $out += "${sep}${white}5h${reset} ${fiveHourColor}${fiveHourPct}%${reset}"
-        $fiveHourReset = Format-EpochResetTime $builtinFiveHourReset "time"
-        if ($fiveHourReset) { $out += " ${dim}@${fiveHourReset}${reset}" }
+        $out += "${sep}${white}5h${reset} $(Format-UsageBar $fiveHourPct 6) ${fiveHourColor}${fiveHourPct}%${reset}"
     }
 
     if ($null -ne $builtinSevenDayPct) {
         $sevenDayPct = [math]::Floor([double]$builtinSevenDayPct)
         $sevenDayColor = Get-UsageColor $sevenDayPct
         $out += "${sep}${white}7d${reset} ${sevenDayColor}${sevenDayPct}%${reset}"
-        $sevenDayReset = Format-EpochResetTime $builtinSevenDayReset "datetime"
-        if ($sevenDayReset) { $out += " ${dim}@${sevenDayReset}${reset}" }
+        $hoursLeft = Get-HoursLeftFromEpoch $builtinSevenDayReset
+        if ($null -ne $hoursLeft) { $out += " ${dim}@${hoursLeft}h${reset}" }
     }
 
     # Render extra_usage from API cache (stdin rate_limits doesn't expose it)
@@ -422,21 +491,18 @@ if ($effectiveBuiltin) {
     try {
         # ---- 5-hour (current) ----
         $fiveHourPct = [math]::Floor([double](Coalesce $parsedUsage.five_hour.utilization 0))
-        $fiveHourResetIso = $parsedUsage.five_hour.resets_at
-        $fiveHourReset = Format-ResetTime $fiveHourResetIso "time"
         $fiveHourColor = Get-UsageColor $fiveHourPct
 
-        $out += "${sep}${white}5h${reset} ${fiveHourColor}${fiveHourPct}%${reset}"
-        if ($fiveHourReset) { $out += " ${dim}@${fiveHourReset}${reset}" }
+        $out += "${sep}${white}5h${reset} $(Format-UsageBar $fiveHourPct 6) ${fiveHourColor}${fiveHourPct}%${reset}"
 
         # ---- 7-day (weekly) ----
         $sevenDayPct = [math]::Floor([double](Coalesce $parsedUsage.seven_day.utilization 0))
         $sevenDayResetIso = $parsedUsage.seven_day.resets_at
-        $sevenDayReset = Format-ResetTime $sevenDayResetIso "datetime"
         $sevenDayColor = Get-UsageColor $sevenDayPct
 
         $out += "${sep}${white}7d${reset} ${sevenDayColor}${sevenDayPct}%${reset}"
-        if ($sevenDayReset) { $out += " ${dim}@${sevenDayReset}${reset}" }
+        $hoursLeft = Get-HoursLeftFromIso $sevenDayResetIso
+        if ($null -ne $hoursLeft) { $out += " ${dim}@${hoursLeft}h${reset}" }
 
         $out += Format-ExtraUsage $parsedUsage
     } catch {}
@@ -488,11 +554,6 @@ if ($env:STATUSLINE_CHECK_UPDATES -ne "false") {
             }
         } catch {}
     }
-}
-
-# Append CLI version as last segment
-if ($cliVersion) {
-    $out += " ${dim}|${reset} ${orange}v${cliVersion}${reset}"
 }
 
 # Output

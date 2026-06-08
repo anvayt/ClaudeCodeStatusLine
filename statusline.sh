@@ -23,6 +23,11 @@ purple='\033[38;2;167;139;250m'
 white='\033[38;2;220;220;220m'
 dim='\033[2m'
 reset='\033[0m'
+bold='\033[1m'
+
+# Badge styling for the model "pill"
+bg_model='\033[48;2;30;102;180m'      # blue badge background
+fg_badge='\033[1;38;2;245;248;255m'   # bright bold text on the badge
 
 # Format token counts (e.g., 50k / 200k)
 format_tokens() {
@@ -70,6 +75,46 @@ version_gt() {
     [ "$a3" -gt "$b3" ] 2>/dev/null && return 0
     return 1
 }
+
+# Build a compact horizontal usage bar (e.g. ███░░░) colored by fill level
+# Usage: usage_bar <pct> <cells>  — emits literal \033 sequences (interpreted by final printf %b)
+usage_bar() {
+    local pct=$1 cells=$2
+    [ "$pct" -lt 0 ] 2>/dev/null && pct=0
+    [ "$pct" -gt 100 ] 2>/dev/null && pct=100
+    local filled=$(( (pct * cells + 50) / 100 ))
+    [ "$filled" -gt "$cells" ] && filled=$cells
+    local color; color=$(usage_color "$pct")
+    local on="" off="" i
+    for ((i=0; i<filled; i++)); do on+="█"; done
+    for ((i=filled; i<cells; i++)); do off+="░"; done
+    printf '%s%s%s%s%s%s' "$color" "$on" "$reset" "$dim" "$off" "$reset"
+}
+
+# Whole hours remaining until a Unix-epoch reset
+hours_left_from_epoch() {
+    local epoch="$1"
+    { [ -z "$epoch" ] || [ "$epoch" = "null" ] || [ "$epoch" = "0" ]; } && return
+    local now diff
+    now=$(date +%s)
+    diff=$(( epoch - now ))
+    [ "$diff" -lt 0 ] && diff=0
+    echo $(( (diff + 3599) / 3600 ))  # ceil to whole hours
+}
+
+# Whole hours remaining until an ISO-8601 reset (uses iso_to_epoch, defined below)
+hours_left_from_iso() {
+    local iso="$1"
+    { [ -z "$iso" ] || [ "$iso" = "null" ]; } && return
+    local epoch now diff
+    epoch=$(iso_to_epoch "$iso")
+    [ -z "$epoch" ] && return
+    now=$(date +%s)
+    diff=$(( epoch - now ))
+    [ "$diff" -lt 0 ] && diff=0
+    echo $(( (diff + 3599) / 3600 ))
+}
+
 # ===== Extract data from JSON =====
 model_name=$(echo "$input" | jq -r '.model.display_name // "Claude"')
 model_name=$(echo "$model_name" | sed 's/ *(\([0-9.]*[kKmM]*\) context)/ \1/')  # "(1M context)" → "1M"
@@ -110,41 +155,68 @@ elif [ -f "$settings_path" ]; then
 fi
 [ -z "$effort_level" ] && effort_level="medium"
 
-# ===== Claude CLI version (cached, 1h TTL) =====
-cli_version_cache="/tmp/claude/statusline-cli-version"
-cli_version=""
-cli_version_max_age=3600
-
-if [ -f "$cli_version_cache" ]; then
-    cv_mtime=$(stat -c %Y "$cli_version_cache" 2>/dev/null || stat -f %m "$cli_version_cache" 2>/dev/null)
-    cv_now=$(date +%s)
-    cv_age=$(( cv_now - cv_mtime ))
-    if [ "$cv_age" -lt "$cli_version_max_age" ]; then
-        cli_version=$(cat "$cli_version_cache" 2>/dev/null)
-    fi
+# ===== Permission mode (not exposed in stdin JSON — read from transcript) =====
+# Claude Code records the active permission mode on every transcript entry and emits a
+# dedicated {"type":"permission-mode",...} event on each shift+tab toggle, so the most
+# recent permissionMode value in the transcript is the live mode. The status line re-runs
+# whenever the permission mode changes, so this segment updates on shift+tab.
+perm_mode=""
+transcript_path=$(echo "$input" | jq -r '.transcript_path // empty')
+if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
+    perm_mode=$(tail -n 200 "$transcript_path" 2>/dev/null \
+        | grep -oE '"permissionMode":"[a-zA-Z]+"' \
+        | tail -n 1 \
+        | sed -E 's/.*"permissionMode":"([a-zA-Z]+)".*/\1/')
 fi
 
-if [ -z "$cli_version" ]; then
-    cli_version=$(claude --version 2>/dev/null | awk '{print $1}')
-    if [ -n "$cli_version" ]; then
-        mkdir -p /tmp/claude 2>/dev/null
-        echo "$cli_version" > "$cli_version_cache"
-    fi
-fi
+# Map permission mode to a compact label + color
+mode_label=""
+mode_color="$white"
+case "$perm_mode" in
+    default)           mode_label="default";      mode_color="$white" ;;
+    auto)              mode_label="auto";         mode_color="$green" ;;
+    acceptEdits)       mode_label="accept-edits"; mode_color="$yellow" ;;
+    plan)              mode_label="plan";         mode_color="$cyan" ;;
+    bypassPermissions) mode_label="bypass";       mode_color="$red" ;;
+    *)                 [ -n "$perm_mode" ] && mode_label="$perm_mode" ;;
+esac
 
 # ===== Build single-line output =====
 out=""
-out+="${blue}${model_name}${reset}"
+# Model "pill": diamond glyph + name on a colored badge
+out+="${bg_model}${fg_badge} ◆ ${model_name} ${reset}"
 
-# Current working directory
+# Current working directory (clickable GitHub repo/branch link when available)
 cwd=$(echo "$input" | jq -r '.cwd // empty')
 if [ -n "$cwd" ]; then
     display_dir="${cwd##*/}"
     git_branch=$(git -C "${cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+    # Build a clickable GitHub URL from origin repo info (provided in the stdin JSON)
+    repo_host=$(echo "$input" | jq -r '.workspace.repo.host // empty')
+    repo_owner=$(echo "$input" | jq -r '.workspace.repo.owner // empty')
+    repo_name=$(echo "$input" | jq -r '.workspace.repo.name // empty')
+    branch_url=""
+    if [ -n "$repo_host" ] && [ -n "$repo_owner" ] && [ -n "$repo_name" ]; then
+        if [ -n "$git_branch" ]; then
+            branch_url="https://${repo_host}/${repo_owner}/${repo_name}/tree/${git_branch}"
+        else
+            branch_url="https://${repo_host}/${repo_owner}/${repo_name}"
+        fi
+    fi
+
+    dir_text="${cyan}${display_dir}${reset}"
+    [ -n "$git_branch" ] && dir_text+="${dim}@${reset}${green}${git_branch}${reset}"
+
     out+=" ${dim}|${reset} "
-    out+="${cyan}${display_dir}${reset}"
+    if [ -n "$branch_url" ]; then
+        # OSC 8 hyperlink (BEL-terminated); \033 and \007 are interpreted by the final printf %b
+        out+="\033]8;;${branch_url}\007${dir_text}\033]8;;\007"
+    else
+        out+="${dir_text}"
+    fi
+
     if [ -n "$git_branch" ]; then
-        out+="${dim}@${reset}${green}${git_branch}${reset}"
         git_stat=$(git -C "${cwd}" diff --numstat 2>/dev/null | awk '{a+=$1; d+=$2} END {if (a+d>0) printf "+%d -%d", a, d}')
         [ -n "$git_stat" ] && out+=" ${dim}(${reset}${green}${git_stat%% *}${reset} ${red}${git_stat##* }${reset}${dim})${reset}"
     fi
@@ -152,15 +224,19 @@ fi
 
 out+=" ${dim}|${reset} "
 out+="${orange}${used_tokens}/${total_tokens}${reset} ${dim}(${reset}${green}${pct_used}%${reset}${dim})${reset}"
+if [ -n "$mode_label" ]; then
+    out+=" ${dim}|${reset} "
+    out+="mode: ${mode_color}${mode_label}${reset}"
+fi
 out+=" ${dim}|${reset} "
-out+="effort: "
+out+="${dim}effort${reset} "
 case "$effort_level" in
-    low)    out+="${dim}${effort_level}${reset}" ;;
-    medium) out+="${orange}med${reset}" ;;
-    high)   out+="${green}${effort_level}${reset}" ;;
-    xhigh)  out+="${purple}${effort_level}${reset}" ;;
-    max)    out+="${red}${effort_level}${reset}" ;;
-    *)      out+="${green}${effort_level}${reset}" ;;
+    low)    out+="${dim}▂ low${reset}" ;;
+    medium) out+="${orange}▄ med${reset}" ;;
+    high)   out+="${green}▆ high${reset}" ;;
+    xhigh)  out+="${purple}${bold}▇ xhigh${reset}" ;;
+    max)    out+="${red}${bold}█ max${reset}" ;;
+    *)      out+="${green}▆ ${effort_level}${reset}" ;;
 esac
 
 # ===== Cross-platform OAuth token resolution (from statusline.sh) =====
@@ -400,21 +476,15 @@ if $effective_builtin; then
     if [ -n "$builtin_five_hour_pct" ]; then
         five_hour_pct=$(printf "%.0f" "$builtin_five_hour_pct")
         five_hour_color=$(usage_color "$five_hour_pct")
-        out+="${sep}${white}5h${reset} ${five_hour_color}${five_hour_pct}%${reset}"
-        if [ -n "$builtin_five_hour_reset" ] && [ "$builtin_five_hour_reset" != "null" ]; then
-            five_hour_reset=$(date -j -r "$builtin_five_hour_reset" +"%H:%M" 2>/dev/null || date -d "@$builtin_five_hour_reset" +"%H:%M" 2>/dev/null)
-            [ -n "$five_hour_reset" ] && out+=" ${dim}@${five_hour_reset}${reset}"
-        fi
+        out+="${sep}${white}5h${reset} $(usage_bar "$five_hour_pct" 6) ${five_hour_color}${five_hour_pct}%${reset}"
     fi
 
     if [ -n "$builtin_seven_day_pct" ]; then
         seven_day_pct=$(printf "%.0f" "$builtin_seven_day_pct")
         seven_day_color=$(usage_color "$seven_day_pct")
         out+="${sep}${white}7d${reset} ${seven_day_color}${seven_day_pct}%${reset}"
-        if [ -n "$builtin_seven_day_reset" ] && [ "$builtin_seven_day_reset" != "null" ]; then
-            seven_day_reset=$(date -j -r "$builtin_seven_day_reset" +"%a %b %-d, %H:%M" 2>/dev/null || date -d "@$builtin_seven_day_reset" +"%a %b %-d, %H:%M" 2>/dev/null)
-            [ -n "$seven_day_reset" ] && out+=" ${dim}@${seven_day_reset}${reset}"
-        fi
+        hours_left=$(hours_left_from_epoch "$builtin_seven_day_reset")
+        [ -n "$hours_left" ] && out+=" ${dim}@${hours_left}h${reset}"
     fi
 
     # Render extra_usage from API cache (stdin rate_limits doesn't expose it)
@@ -445,21 +515,18 @@ elif [ -n "$usage_data" ] && echo "$usage_data" | jq -e '.five_hour' >/dev/null 
     # ---- Fall back: API-fetched usage data ----
     # ---- 5-hour (current) ----
     five_hour_pct=$(echo "$usage_data" | jq -r '.five_hour.utilization // 0' | awk '{printf "%.0f", $1}')
-    five_hour_reset_iso=$(echo "$usage_data" | jq -r '.five_hour.resets_at // empty')
-    five_hour_reset=$(format_reset_time "$five_hour_reset_iso" "time")
     five_hour_color=$(usage_color "$five_hour_pct")
 
-    out+="${sep}${white}5h${reset} ${five_hour_color}${five_hour_pct}%${reset}"
-    [ -n "$five_hour_reset" ] && out+=" ${dim}@${five_hour_reset}${reset}"
+    out+="${sep}${white}5h${reset} $(usage_bar "$five_hour_pct" 6) ${five_hour_color}${five_hour_pct}%${reset}"
 
     # ---- 7-day (weekly) ----
     seven_day_pct=$(echo "$usage_data" | jq -r '.seven_day.utilization // 0' | awk '{printf "%.0f", $1}')
     seven_day_reset_iso=$(echo "$usage_data" | jq -r '.seven_day.resets_at // empty')
-    seven_day_reset=$(format_reset_time "$seven_day_reset_iso" "datetime")
     seven_day_color=$(usage_color "$seven_day_pct")
 
     out+="${sep}${white}7d${reset} ${seven_day_color}${seven_day_pct}%${reset}"
-    [ -n "$seven_day_reset" ] && out+=" ${dim}@${seven_day_reset}${reset}"
+    hours_left=$(hours_left_from_iso "$seven_day_reset_iso")
+    [ -n "$hours_left" ] && out+=" ${dim}@${hours_left}h${reset}"
 
     render_extra_usage "$usage_data"
 else
@@ -507,11 +574,6 @@ if [ "${STATUSLINE_CHECK_UPDATES:-true}" != "false" ]; then
             update_line="\n${dim}Update available: ${latest_tag} → Tell Claude: \"Find my installed status bar and update it\"${reset}"
         fi
     fi
-fi
-
-# Append CLI version as last segment
-if [ -n "$cli_version" ]; then
-    out+=" ${dim}|${reset} ${orange}v${cli_version}${reset}"
 fi
 
 # Output
