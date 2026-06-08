@@ -29,6 +29,17 @@ bold='\033[1m'
 bg_model='\033[48;2;30;102;180m'      # blue badge background
 fg_badge='\033[1;38;2;245;248;255m'   # bright bold text on the badge
 
+# Background colors for pills + the usage bar. These render via SGR codes (not fonts),
+# so they show as solid filled blocks even where Unicode glyphs fall back to "?".
+fg_pill='\033[1;38;2;250;250;250m'   # bold near-white text on a pill
+bg_gray='\033[48;2;64;64;64m'        # empty portion of the usage bar
+bg_dim='\033[48;2;90;90;90m'
+bg_green='\033[48;2;0;150;60m'
+bg_yellow='\033[48;2;200;170;0m'
+bg_orange='\033[48;2;210;130;40m'
+bg_red='\033[48;2;200;60;60m'
+bg_purple='\033[48;2;120;90;210m'
+
 # Format token counts (e.g., 50k / 200k)
 format_tokens() {
     local num=$1
@@ -76,7 +87,18 @@ version_gt() {
     return 1
 }
 
-# Build a compact horizontal usage bar (e.g. ███░░░) colored by fill level
+# Return a background-color escape based on usage percentage (for the filled bar)
+usage_bg_color() {
+    local pct=$1
+    if [ "$pct" -ge 90 ]; then echo "$bg_red"
+    elif [ "$pct" -ge 70 ]; then echo "$bg_orange"
+    elif [ "$pct" -ge 50 ]; then echo "$bg_yellow"
+    else echo "$bg_green"
+    fi
+}
+
+# Build a filled-rectangle usage bar from background-colored spaces (no glyphs, font-safe).
+# Filled cells take the usage color; empty cells stay dark gray so the rectangle is always visible.
 # Usage: usage_bar <pct> <cells>  — emits literal \033 sequences (interpreted by final printf %b)
 usage_bar() {
     local pct=$1 cells=$2
@@ -84,11 +106,11 @@ usage_bar() {
     [ "$pct" -gt 100 ] 2>/dev/null && pct=100
     local filled=$(( (pct * cells + 50) / 100 ))
     [ "$filled" -gt "$cells" ] && filled=$cells
-    local color; color=$(usage_color "$pct")
+    local fill_bg; fill_bg=$(usage_bg_color "$pct")
     local on="" off="" i
-    for ((i=0; i<filled; i++)); do on+="█"; done
-    for ((i=filled; i<cells; i++)); do off+="░"; done
-    printf '%s%s%s%s%s%s' "$color" "$on" "$reset" "$dim" "$off" "$reset"
+    for ((i=0; i<filled; i++)); do on+=" "; done
+    for ((i=filled; i<cells; i++)); do off+=" "; done
+    printf '%s%s%s%s%s%s' "$fill_bg" "$on" "$reset" "$bg_gray" "$off" "$reset"
 }
 
 # Whole hours remaining until a Unix-epoch reset
@@ -155,36 +177,10 @@ elif [ -f "$settings_path" ]; then
 fi
 [ -z "$effort_level" ] && effort_level="medium"
 
-# ===== Permission mode (not exposed in stdin JSON — read from transcript) =====
-# Claude Code records the active permission mode on every transcript entry and emits a
-# dedicated {"type":"permission-mode",...} event on each shift+tab toggle, so the most
-# recent permissionMode value in the transcript is the live mode. The status line re-runs
-# whenever the permission mode changes, so this segment updates on shift+tab.
-perm_mode=""
-transcript_path=$(echo "$input" | jq -r '.transcript_path // empty')
-if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
-    perm_mode=$(tail -n 200 "$transcript_path" 2>/dev/null \
-        | grep -oE '"permissionMode":"[a-zA-Z]+"' \
-        | tail -n 1 \
-        | sed -E 's/.*"permissionMode":"([a-zA-Z]+)".*/\1/')
-fi
-
-# Map permission mode to a compact label + color
-mode_label=""
-mode_color="$white"
-case "$perm_mode" in
-    default)           mode_label="default";      mode_color="$white" ;;
-    auto)              mode_label="auto";         mode_color="$green" ;;
-    acceptEdits)       mode_label="accept-edits"; mode_color="$yellow" ;;
-    plan)              mode_label="plan";         mode_color="$cyan" ;;
-    bypassPermissions) mode_label="bypass";       mode_color="$red" ;;
-    *)                 [ -n "$perm_mode" ] && mode_label="$perm_mode" ;;
-esac
-
 # ===== Build single-line output =====
 out=""
-# Model "pill": diamond glyph + name on a colored badge
-out+="${bg_model}${fg_badge} ◆ ${model_name} ${reset}"
+# Model "pill": name on a colored badge (glyph-free so it never falls back to "?")
+out+="${bg_model}${fg_badge} ${model_name} ${reset}"
 
 # Current working directory (clickable GitHub repo/branch link when available)
 cwd=$(echo "$input" | jq -r '.cwd // empty')
@@ -224,19 +220,15 @@ fi
 
 out+=" ${dim}|${reset} "
 out+="${orange}${used_tokens}/${total_tokens}${reset} ${dim}(${reset}${green}${pct_used}%${reset}${dim})${reset}"
-if [ -n "$mode_label" ]; then
-    out+=" ${dim}|${reset} "
-    out+="mode: ${mode_color}${mode_label}${reset}"
-fi
 out+=" ${dim}|${reset} "
 out+="${dim}effort${reset} "
 case "$effort_level" in
-    low)    out+="${dim}▂ low${reset}" ;;
-    medium) out+="${orange}▄ med${reset}" ;;
-    high)   out+="${green}▆ high${reset}" ;;
-    xhigh)  out+="${purple}${bold}▇ xhigh${reset}" ;;
-    max)    out+="${red}${bold}█ max${reset}" ;;
-    *)      out+="${green}▆ ${effort_level}${reset}" ;;
+    low)    out+="${bg_dim}${fg_pill} LOW ${reset}" ;;
+    medium) out+="${bg_orange}${fg_pill} MED ${reset}" ;;
+    high)   out+="${bg_green}${fg_pill} HIGH ${reset}" ;;
+    xhigh)  out+="${bg_purple}${fg_pill} XHIGH ${reset}" ;;
+    max)    out+="${bg_red}${fg_pill} MAX ${reset}" ;;
+    *)      out+="${bg_green}${fg_pill} $(echo "$effort_level" | tr '[:lower:]' '[:upper:]') ${reset}" ;;
 esac
 
 # ===== Cross-platform OAuth token resolution (from statusline.sh) =====
@@ -476,7 +468,7 @@ if $effective_builtin; then
     if [ -n "$builtin_five_hour_pct" ]; then
         five_hour_pct=$(printf "%.0f" "$builtin_five_hour_pct")
         five_hour_color=$(usage_color "$five_hour_pct")
-        out+="${sep}${white}5h${reset} $(usage_bar "$five_hour_pct" 6) ${five_hour_color}${five_hour_pct}%${reset}"
+        out+="${sep}${white}5h${reset} $(usage_bar "$five_hour_pct" 10) ${five_hour_color}${five_hour_pct}%${reset}"
     fi
 
     if [ -n "$builtin_seven_day_pct" ]; then
@@ -517,7 +509,7 @@ elif [ -n "$usage_data" ] && echo "$usage_data" | jq -e '.five_hour' >/dev/null 
     five_hour_pct=$(echo "$usage_data" | jq -r '.five_hour.utilization // 0' | awk '{printf "%.0f", $1}')
     five_hour_color=$(usage_color "$five_hour_pct")
 
-    out+="${sep}${white}5h${reset} $(usage_bar "$five_hour_pct" 6) ${five_hour_color}${five_hour_pct}%${reset}"
+    out+="${sep}${white}5h${reset} $(usage_bar "$five_hour_pct" 10) ${five_hour_color}${five_hour_pct}%${reset}"
 
     # ---- 7-day (weekly) ----
     seven_day_pct=$(echo "$usage_data" | jq -r '.seven_day.utilization // 0' | awk '{printf "%.0f", $1}')
@@ -536,9 +528,11 @@ else
 fi
 
 # ===== Update check (cached, 24h TTL) =====
-# Set STATUSLINE_CHECK_UPDATES=false to disable the update check (no network calls).
+# Disabled by default in this fork: the "Update available" notice appends a newline
+# (forcing a second status-line row), and it checks the *upstream* repo's releases,
+# which is meaningless for a customized fork. Opt back in with STATUSLINE_CHECK_UPDATES=true.
 update_line=""
-if [ "${STATUSLINE_CHECK_UPDATES:-true}" != "false" ]; then
+if [ "${STATUSLINE_CHECK_UPDATES:-false}" = "true" ]; then
     version_cache_file="/tmp/claude/statusline-version-cache.json"
     version_cache_max_age=86400  # 24 hours
 

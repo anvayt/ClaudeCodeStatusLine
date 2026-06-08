@@ -32,6 +32,17 @@ $bgModel = "${esc}[48;2;30;102;180m"      # blue badge background
 $fgBadge = "${esc}[1;38;2;245;248;255m"   # bright bold text on the badge
 $st      = "${esc}\"                       # OSC string terminator (ESC + backslash)
 
+# Background colors for pills + the usage bar. These render via SGR codes (not fonts),
+# so they show as solid filled blocks even where Unicode glyphs fall back to "?".
+$fgPill   = "${esc}[1;38;2;250;250;250m"  # bold near-white text on a pill
+$bgGray   = "${esc}[48;2;64;64;64m"       # empty portion of the usage bar
+$bgDim    = "${esc}[48;2;90;90;90m"
+$bgGreen  = "${esc}[48;2;0;150;60m"
+$bgYellow = "${esc}[48;2;200;170;0m"
+$bgOrange = "${esc}[48;2;210;130;40m"
+$bgRed    = "${esc}[48;2;200;60;60m"
+$bgPurple = "${esc}[48;2;120;90;210m"
+
 # Format token counts (e.g., 50k / 200k)
 function Format-Tokens([long]$num) {
     if ($num -ge 1000000) {
@@ -78,16 +89,25 @@ function Format-Hyperlink([string]$url, [string]$text) {
     return "${esc}]8;;${url}${st}${text}${esc}]8;;${st}"
 }
 
-# Build a compact horizontal usage bar (e.g. ███░░░) colored by fill level
+# Return a background-color escape based on usage percentage (for the filled bar)
+function Get-UsageBgColor([int]$pct) {
+    if ($pct -ge 90) { return $bgRed }
+    elseif ($pct -ge 70) { return $bgOrange }
+    elseif ($pct -ge 50) { return $bgYellow }
+    else { return $bgGreen }
+}
+
+# Build a filled-rectangle usage bar from background-colored spaces (no glyphs, font-safe).
+# Filled cells take the usage color; empty cells stay dark gray so the rectangle is always visible.
 function Format-UsageBar([int]$pct, [int]$cells) {
     if ($pct -lt 0) { $pct = 0 }
     if ($pct -gt 100) { $pct = 100 }
     $filled = [int][math]::Round($pct * $cells / 100)
     if ($filled -gt $cells) { $filled = $cells }
-    $color = Get-UsageColor $pct
-    $on  = [string]([char]0x2588) * $filled            # █
-    $off = [string]([char]0x2591) * ($cells - $filled)  # ░
-    return "${color}${on}${reset}${dim}${off}${reset}"
+    $fillBg = Get-UsageBgColor $pct
+    $on  = " " * $filled
+    $off = " " * ($cells - $filled)
+    return "${fillBg}${on}${reset}${bgGray}${off}${reset}"
 }
 
 # Whole hours remaining until a Unix-epoch reset
@@ -160,39 +180,10 @@ if ($data.effort.level) {
 }
 if (-not $effortLevel) { $effortLevel = "medium" }
 
-# ===== Permission mode (not exposed in stdin JSON — read from transcript) =====
-# Claude Code records the active permission mode on every transcript entry and emits a
-# dedicated {"type":"permission-mode",...} event on each shift+tab toggle, so the most
-# recent permissionMode value in the transcript is the live mode. The status line re-runs
-# whenever the permission mode changes, so this segment updates on shift+tab.
-$permMode = $null
-$transcriptPath = $data.transcript_path
-if ($transcriptPath -and (Test-Path -LiteralPath $transcriptPath)) {
-    try {
-        $tail = @(Get-Content -LiteralPath $transcriptPath -Tail 200 -ErrorAction Stop)
-        for ($i = $tail.Count - 1; $i -ge 0; $i--) {
-            $mm = [regex]::Match($tail[$i], '"permissionMode":"([a-zA-Z]+)"')
-            if ($mm.Success) { $permMode = $mm.Groups[1].Value; break }
-        }
-    } catch {}
-}
-
-# Map permission mode to a compact label + color
-$modeLabel = $null
-$modeColor = $white
-switch ($permMode) {
-    "default"           { $modeLabel = "default";      $modeColor = $white }
-    "auto"              { $modeLabel = "auto";         $modeColor = $green }
-    "acceptEdits"       { $modeLabel = "accept-edits"; $modeColor = $yellow }
-    "plan"              { $modeLabel = "plan";         $modeColor = $cyan }
-    "bypassPermissions" { $modeLabel = "bypass";       $modeColor = $red }
-    default             { if ($permMode) { $modeLabel = $permMode } }
-}
-
 # ===== Build single-line output =====
 $out = ""
-# Model "pill": diamond glyph + name on a colored badge
-$out += "${bgModel}${fgBadge} $([char]0x25C6) ${modelName} ${reset}"
+# Model "pill": name on a colored badge (glyph-free so it never falls back to "?")
+$out += "${bgModel}${fgBadge} ${modelName} ${reset}"
 
 # Current working directory (clickable GitHub repo/branch link when available)
 $cwd = $data.cwd
@@ -243,19 +234,15 @@ if ($cwd) {
 
 $out += " ${dim}|${reset} "
 $out += "${orange}${usedTokens}/${totalTokens}${reset} ${dim}(${reset}${green}${pctUsed}%${reset}${dim})${reset}"
-if ($modeLabel) {
-    $out += " ${dim}|${reset} "
-    $out += "mode: ${modeColor}${modeLabel}${reset}"
-}
 $out += " ${dim}|${reset} "
 $out += "${dim}effort${reset} "
 switch ($effortLevel) {
-    "low"    { $out += "${dim}$([char]0x2582) low${reset}" }
-    "medium" { $out += "${orange}$([char]0x2584) med${reset}" }
-    "high"   { $out += "${green}$([char]0x2586) high${reset}" }
-    "xhigh"  { $out += "${purple}${bold}$([char]0x2587) xhigh${reset}" }
-    "max"    { $out += "${red}${bold}$([char]0x2588) max${reset}" }
-    default  { $out += "${green}$([char]0x2586) ${effortLevel}${reset}" }
+    "low"    { $out += "${bgDim}${fgPill} LOW ${reset}" }
+    "medium" { $out += "${bgOrange}${fgPill} MED ${reset}" }
+    "high"   { $out += "${bgGreen}${fgPill} HIGH ${reset}" }
+    "xhigh"  { $out += "${bgPurple}${fgPill} XHIGH ${reset}" }
+    "max"    { $out += "${bgRed}${fgPill} MAX ${reset}" }
+    default  { $out += "${bgGreen}${fgPill} $($effortLevel.ToUpper()) ${reset}" }
 }
 
 # ===== OAuth token resolution =====
@@ -445,7 +432,7 @@ if ($effectiveBuiltin) {
     if ($null -ne $builtinFiveHourPct) {
         $fiveHourPct = [math]::Floor([double]$builtinFiveHourPct)
         $fiveHourColor = Get-UsageColor $fiveHourPct
-        $out += "${sep}${white}5h${reset} $(Format-UsageBar $fiveHourPct 6) ${fiveHourColor}${fiveHourPct}%${reset}"
+        $out += "${sep}${white}5h${reset} $(Format-UsageBar $fiveHourPct 10) ${fiveHourColor}${fiveHourPct}%${reset}"
     }
 
     if ($null -ne $builtinSevenDayPct) {
@@ -493,7 +480,7 @@ if ($effectiveBuiltin) {
         $fiveHourPct = [math]::Floor([double](Coalesce $parsedUsage.five_hour.utilization 0))
         $fiveHourColor = Get-UsageColor $fiveHourPct
 
-        $out += "${sep}${white}5h${reset} $(Format-UsageBar $fiveHourPct 6) ${fiveHourColor}${fiveHourPct}%${reset}"
+        $out += "${sep}${white}5h${reset} $(Format-UsageBar $fiveHourPct 10) ${fiveHourColor}${fiveHourPct}%${reset}"
 
         # ---- 7-day (weekly) ----
         $sevenDayPct = [math]::Floor([double](Coalesce $parsedUsage.seven_day.utilization 0))
@@ -509,9 +496,11 @@ if ($effectiveBuiltin) {
 }
 
 # ===== Update check (cached, 24h TTL) =====
-# Set STATUSLINE_CHECK_UPDATES=false to disable the update check (no network calls).
+# Disabled by default in this fork: the "Update available" notice appends a newline
+# (forcing a second status-line row), and it checks the *upstream* repo's releases,
+# which is meaningless for a customized fork. Opt back in with STATUSLINE_CHECK_UPDATES=true.
 $updateLine = ""
-if ($env:STATUSLINE_CHECK_UPDATES -ne "false") {
+if ($env:STATUSLINE_CHECK_UPDATES -eq "true") {
     $versionCacheFile = Join-Path $cacheDir "statusline-version-cache.json"
     $versionCacheMaxAge = 86400  # 24 hours
 
